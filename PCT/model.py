@@ -3,6 +3,39 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def _create_orthogonal_random_matrix(d: int, m: int, device, dtype) -> torch.Tensor:
+    blocks = []
+    full_blocks = m // d
+    remainder = m % d
+
+    for _ in range(full_blocks):
+        q, _ = torch.linalg.qr(torch.randn(d, d, device=device, dtype=dtype), mode="reduced")
+        blocks.append(q)
+    if remainder > 0:
+        q, _ = torch.linalg.qr(torch.randn(d, d, device=device, dtype=dtype), mode="reduced")
+        blocks.append(q[:, :remainder])
+
+    projection = torch.cat(blocks, dim=1) if blocks else torch.empty(d, 0, device=device, dtype=dtype)
+    scales = torch.randn(m, d, device=device, dtype=dtype).norm(dim=1)
+    projection = projection * scales.unsqueeze(0)
+    return projection
+
+
+def _softmax_positive_feature_map_hyp(
+    x: torch.Tensor, projection: torch.Tensor, eps: float = 1e-6
+) -> torch.Tensor:
+    # x: [B, N, D], projection: [D, M] -> [B, N, 2M]
+    projected = torch.matmul(x, projection)  # [B,N,M]
+    x_norm = (x ** 2).sum(dim=-1, keepdim=True) * 0.5
+    pos = projected - x_norm
+    neg = -projected - x_norm
+
+    pos = pos - pos.max(dim=-1, keepdim=True)[0]
+    neg = neg - neg.max(dim=-1, keepdim=True)[0]
+    features = torch.cat([torch.exp(pos), torch.exp(neg)], dim=-1)
+    return features * ((2.0 * projection.shape[1]) ** -0.5) + eps
+
+
 def knn(x: torch.Tensor, k: int) -> torch.Tensor:
     # x: [B, N, C]
     dist = torch.cdist(x, x)
@@ -136,18 +169,81 @@ class OffsetAttention(nn.Module):
         return out
 
 
+class PerformerOffsetAttention(nn.Module):
+    def __init__(self, channels: int, nb_features: int = 64):
+        super().__init__()
+        da = channels // 4
+        self.q = nn.Conv1d(channels, da, 1, bias=False)
+        self.k = nn.Conv1d(channels, da, 1, bias=False)
+        self.v = nn.Conv1d(channels, channels, 1, bias=False)
+        self.proj = LBR1d(channels, channels)
+        self.nb_features = nb_features
+        self.eps = 1e-6
+        projection = _create_orthogonal_random_matrix(da, nb_features, device="cpu", dtype=torch.float32)
+        self.register_buffer("projection_matrix", projection)
+
+    @torch.no_grad()
+    def redraw_projection_matrix(self):
+        d = self.projection_matrix.shape[0]
+        m = self.nb_features
+        self.projection_matrix.copy_(
+            _create_orthogonal_random_matrix(
+                d=d,
+                m=m,
+                device=self.projection_matrix.device,
+                dtype=self.projection_matrix.dtype,
+            )
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, C, N]
+        q = self.q(x).transpose(1, 2).contiguous()  # [B,N,Da]
+        k = self.k(x).transpose(1, 2).contiguous()  # [B,N,Da]
+        v = self.v(x).transpose(1, 2).contiguous()  # [B,N,C]
+        scale = q.shape[-1] ** -0.25
+        q = q * scale
+        k = k * scale
+
+        q_prime = _softmax_positive_feature_map_hyp(q, self.projection_matrix, eps=self.eps)  # [B,N,2M]
+        k_prime = _softmax_positive_feature_map_hyp(k, self.projection_matrix, eps=self.eps)  # [B,N,2M]
+
+        kv = torch.einsum("bnm,bnc->bmc", k_prime, v)  # [B,2M,C]
+        k_sum = k_prime.sum(dim=1)  # [B,2M]
+        denom = torch.einsum("bnm,bm->bn", q_prime, k_sum).unsqueeze(-1)  # [B,N,1]
+        denom = denom + self.eps
+
+        fsa = torch.einsum("bnm,bmc->bnc", q_prime, kv) / denom  # [B,N,C]
+        fsa = fsa.transpose(1, 2).contiguous()  # [B,C,N]
+
+        out = self.proj(x - fsa) + x
+        return out
+
+
 class PCTClassifier(nn.Module):
-    def __init__(self, num_classes: int, npoints: int = 1024, dropout: float = 0.5):
+    def __init__(
+        self,
+        num_classes: int,
+        npoints: int = 1024,
+        dropout: float = 0.5,
+        performer: bool = False,
+        performer_nb_features: int = 64,
+    ):
         super().__init__()
         self.embed = NeighborEmbedding(npoints=npoints)
-        self.att1 = OffsetAttention(256)
-        self.att2 = OffsetAttention(256)
-        self.att3 = OffsetAttention(256)
-        self.att4 = OffsetAttention(256)
+        if performer:
+            self.att1 = PerformerOffsetAttention(256, nb_features=performer_nb_features)
+            self.att2 = PerformerOffsetAttention(256, nb_features=performer_nb_features)
+            self.att3 = PerformerOffsetAttention(256, nb_features=performer_nb_features)
+            self.att4 = PerformerOffsetAttention(256, nb_features=performer_nb_features)
+        else:
+            self.att1 = OffsetAttention(256)
+            self.att2 = OffsetAttention(256)
+            self.att3 = OffsetAttention(256)
+            self.att4 = OffsetAttention(256)
         self.linear_fuse = nn.Sequential(
             nn.Conv1d(256 * 4, 1024, 1, bias=False),
             nn.BatchNorm1d(1024),
-            nn.LeakyReLU(negative_slope=0.2, inplace=True),
+            nn.ReLU(inplace=True),
         )
         self.cls_head = nn.Sequential(
             nn.Linear(2048, 512, bias=False),
@@ -177,3 +273,8 @@ class PCTClassifier(nn.Module):
         out_avg = F.adaptive_avg_pool1d(out, 1).squeeze(-1)
         global_feat = torch.cat([out_max, out_avg], dim=1)
         return self.cls_head(global_feat)
+
+    def redraw_projection_matrices(self):
+        for module in self.modules():
+            if hasattr(module, "redraw_projection_matrix"):
+                module.redraw_projection_matrix()
