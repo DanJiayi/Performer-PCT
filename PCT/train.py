@@ -72,7 +72,9 @@ def evaluate(model, loader, criterion, device):
 def main():
     parser = argparse.ArgumentParser("Train PCT on ModelNet10")
     parser.add_argument("--data_root", type=str, default="data/ModelNet10")
-    parser.add_argument("--epochs", type=int, default=100)
+    # Paper (PCT classification on ModelNet40) uses 250 epochs, bs=32, lr=0.01, 1024 points.
+    # We keep these as defaults for best alignment, while training on ModelNet10 here.
+    parser.add_argument("--epochs", type=int, default=250)
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--npoints", type=int, default=1024)
     parser.add_argument("--lr", type=float, default=0.01)
