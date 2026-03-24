@@ -79,6 +79,8 @@ def run_epoch(model, loader, criterion, optimizer, device, redraw_interval=0, gl
     meter = Meter()
     step_times = []
     epoch_start = time.perf_counter()
+    if hasattr(model, "reset_attention_timing"):
+        model.reset_attention_timing()
     sample_count = 0
     for pts, labels in loader:
         if redraw_interval > 0 and hasattr(model, "redraw_projection_matrices"):
@@ -103,6 +105,7 @@ def run_epoch(model, loader, criterion, optimizer, device, redraw_interval=0, gl
         "epoch_time_s": epoch_time,
         "avg_step_time_s": float(np.mean(step_times)) if step_times else 0.0,
         "samples_per_s": sample_count / max(epoch_time, 1e-9),
+        "attention_time_s": model.get_attention_timing() if hasattr(model, "get_attention_timing") else 0.0,
     }
     return meter, speed, global_step
 
@@ -123,6 +126,8 @@ def evaluate(model, loader, criterion, device):
 @torch.no_grad()
 def benchmark_inference(model, loader, device, warmup_steps=10, measure_steps=50):
     model.eval()
+    if hasattr(model, "reset_attention_timing"):
+        model.reset_attention_timing()
     batches = []
     for i, batch in enumerate(loader):
         batches.append(batch)
@@ -152,12 +157,18 @@ def benchmark_inference(model, loader, device, warmup_steps=10, measure_steps=50
         sample_total += labels.size(0)
 
     if not timings:
-        return {"avg_latency_ms": 0.0, "throughput_samples_s": 0.0}
+        return {"avg_latency_ms": 0.0, "throughput_samples_s": 0.0, "attention_latency_ms": 0.0}
 
     total_time = sum(timings)
     return {
         "avg_latency_ms": 1000.0 * float(np.mean(timings)),
         "throughput_samples_s": sample_total / max(total_time, 1e-9),
+        "attention_latency_ms": (
+            1000.0
+            * (model.get_attention_timing() / max(len(timings), 1))
+            if hasattr(model, "get_attention_timing")
+            else 0.0
+        ),
     }
 
 
@@ -263,7 +274,8 @@ def main():
         speed_msg = (
             f"TrainSpeed epoch_time {train_speed['epoch_time_s']:.3f}s | "
             f"step_time {train_speed['avg_step_time_s']*1000:.3f}ms | "
-            f"throughput {train_speed['samples_per_s']:.2f} samples/s"
+            f"throughput {train_speed['samples_per_s']:.2f} samples/s | "
+            f"attention_time {train_speed['attention_time_s']:.3f}s"
         )
         logger.log(epoch_msg)
         logger.log(speed_msg)
@@ -281,7 +293,8 @@ def main():
     )
     logger.log(
         f"Inference summary | latency {infer_speed['avg_latency_ms']:.3f}ms/batch | "
-        f"throughput {infer_speed['throughput_samples_s']:.2f} samples/s"
+        f"throughput {infer_speed['throughput_samples_s']:.2f} samples/s | "
+        f"attention_latency {infer_speed['attention_latency_ms']:.3f}ms/batch"
     )
     if device.type == "cuda":
         peak_mem = torch.cuda.max_memory_allocated(device) / (1024 ** 2)

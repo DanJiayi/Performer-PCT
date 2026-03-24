@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import time
 
 
 def _create_orthogonal_random_matrix(d: int, m: int, device, dtype) -> torch.Tensor:
@@ -153,9 +154,23 @@ class OffsetAttention(nn.Module):
         self.k = nn.Conv1d(channels, da, 1, bias=False)
         self.v = nn.Conv1d(channels, channels, 1, bias=False)
         self.proj = LBR1d(channels, channels)
+        self.attn_time_s = 0.0
+
+    @staticmethod
+    def _sync_if_cuda(x: torch.Tensor):
+        if x.is_cuda:
+            torch.cuda.synchronize(x.device)
+
+    def reset_timing(self):
+        self.attn_time_s = 0.0
+
+    def get_timing(self) -> float:
+        return float(self.attn_time_s)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, N]
+        self._sync_if_cuda(x)
+        t0 = time.perf_counter()
         q = self.q(x).transpose(1, 2)      # [B,N,Da]
         k = self.k(x)                       # [B,Da,N]
         v = self.v(x).transpose(1, 2)      # [B,N,C]
@@ -166,6 +181,8 @@ class OffsetAttention(nn.Module):
         fsa = torch.bmm(attn, v).transpose(1, 2).contiguous()  # [B,C,N]
 
         out = self.proj(x - fsa) + x
+        self._sync_if_cuda(x)
+        self.attn_time_s += time.perf_counter() - t0
         return out
 
 
@@ -181,6 +198,18 @@ class PerformerOffsetAttention(nn.Module):
         self.eps = 1e-6
         projection = _create_orthogonal_random_matrix(da, nb_features, device="cpu", dtype=torch.float32)
         self.register_buffer("projection_matrix", projection)
+        self.attn_time_s = 0.0
+
+    @staticmethod
+    def _sync_if_cuda(x: torch.Tensor):
+        if x.is_cuda:
+            torch.cuda.synchronize(x.device)
+
+    def reset_timing(self):
+        self.attn_time_s = 0.0
+
+    def get_timing(self) -> float:
+        return float(self.attn_time_s)
 
     @torch.no_grad()
     def redraw_projection_matrix(self):
@@ -197,6 +226,8 @@ class PerformerOffsetAttention(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, C, N]
+        self._sync_if_cuda(x)
+        t0 = time.perf_counter()
         q = self.q(x).transpose(1, 2).contiguous()  # [B,N,Da]
         k = self.k(x).transpose(1, 2).contiguous()  # [B,N,Da]
         v = self.v(x).transpose(1, 2).contiguous()  # [B,N,C]
@@ -207,15 +238,17 @@ class PerformerOffsetAttention(nn.Module):
         q_prime = _softmax_positive_feature_map_hyp(q, self.projection_matrix, eps=self.eps)  # [B,N,2M]
         k_prime = _softmax_positive_feature_map_hyp(k, self.projection_matrix, eps=self.eps)  # [B,N,2M]
 
-        kv = torch.einsum("bnm,bnc->bmc", k_prime, v)  # [B,2M,C]
+        kv = torch.bmm(k_prime.transpose(1, 2), v)  # [B,2M,N] @ [B,N,C] -> [B,2M,C]
         k_sum = k_prime.sum(dim=1)  # [B,2M]
-        denom = torch.einsum("bnm,bm->bn", q_prime, k_sum).unsqueeze(-1)  # [B,N,1]
+        denom = torch.bmm(q_prime, k_sum.unsqueeze(-1))  # [B,N,2M] @ [B,2M,1] -> [B,N,1]
         denom = denom + self.eps
 
-        fsa = torch.einsum("bnm,bmc->bnc", q_prime, kv) / denom  # [B,N,C]
+        fsa = torch.bmm(q_prime, kv) / denom  # [B,N,2M] @ [B,2M,C] -> [B,N,C]
         fsa = fsa.transpose(1, 2).contiguous()  # [B,C,N]
 
         out = self.proj(x - fsa) + x
+        self._sync_if_cuda(x)
+        self.attn_time_s += time.perf_counter() - t0
         return out
 
 
@@ -278,3 +311,15 @@ class PCTClassifier(nn.Module):
         for module in self.modules():
             if hasattr(module, "redraw_projection_matrix"):
                 module.redraw_projection_matrix()
+
+    def reset_attention_timing(self):
+        for module in [self.att1, self.att2, self.att3, self.att4]:
+            if hasattr(module, "reset_timing"):
+                module.reset_timing()
+
+    def get_attention_timing(self) -> float:
+        total = 0.0
+        for module in [self.att1, self.att2, self.att3, self.att4]:
+            if hasattr(module, "get_timing"):
+                total += module.get_timing()
+        return total
