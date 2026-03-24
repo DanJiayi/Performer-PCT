@@ -1,0 +1,8 @@
+# Dataset / artifacts / runtime logs
+data/
+checkpoints/
+logs/
+
+# Python cache files
+__pycache__/
+*.pyc

@@ -11,8 +11,8 @@ import torch.nn as nn
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 
-from PCT.dataset import ModelNet10
-from PCT.model import PCTClassifier
+from dataset import ModelNet10
+from model import PCTClassifier
 
 
 class Logger:
