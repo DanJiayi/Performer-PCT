@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import time
+import math
 
 
 def _create_orthogonal_random_matrix(d: int, m: int, device, dtype) -> torch.Tensor:
@@ -31,8 +32,10 @@ def _softmax_positive_feature_map_hyp(
     pos = projected - x_norm
     neg = -projected - x_norm
 
-    pos = pos - pos.max(dim=-1, keepdim=True)[0]
-    neg = neg - neg.max(dim=-1, keepdim=True)[0]
+    # Use a single stabilization baseline for both halves to preserve relative scaling.
+    m = torch.cat([pos, neg], dim=-1).max(dim=-1, keepdim=True)[0]
+    pos = pos - m
+    neg = neg - m
     features = torch.cat([torch.exp(pos), torch.exp(neg)], dim=-1)
     return features * ((2.0 * projection.shape[1]) ** -0.5) + eps
 
@@ -72,6 +75,44 @@ def farthest_point_sample(xyz: torch.Tensor, npoint: int) -> torch.Tensor:
         distance[mask] = dist[mask]
         farthest = torch.max(distance, -1)[1]
     return centroids
+
+
+class GeoRFF(nn.Module):
+    """
+    Learnable Gaussian/RBF RFF features from token coordinates.
+
+    It approximates a positive kernel of the form:
+      K(i,j) ~ exp(-tau * ||h(pos_i) - h(pos_j)||^2)
+    using random Fourier features:
+      phi(pos) = [cos(z @ omega), sin(z @ omega)] / sqrt(r)
+    """
+
+    def __init__(self, d_geo: int = 16, r_geo: int = 16):
+        super().__init__()
+        self.d_geo = d_geo
+        self.r_geo = r_geo
+        self.geo_mlp = nn.Sequential(
+            nn.Linear(3, d_geo),
+            nn.ReLU(inplace=True),
+            nn.Linear(d_geo, d_geo),
+        )
+        # Learnable temperature tau. Kept scalar to match the screenshot-style design.
+        self.log_tau = nn.Parameter(torch.tensor(0.0))
+        omega = _create_orthogonal_random_matrix(d_geo, r_geo, device="cpu", dtype=torch.float32)
+        self.register_buffer("omega_geo", omega)
+        self.register_buffer("_inv_sqrt_r", torch.tensor(1.0 / math.sqrt(r_geo), dtype=torch.float32))
+
+    def forward(self, pos: torch.Tensor) -> torch.Tensor:
+        # pos: [B, N, 3]
+        g = self.geo_mlp(pos)  # [B, N, d_geo]
+        tau = F.softplus(self.log_tau) + 1e-6
+        z = torch.sqrt(2.0 * tau) * g  # [B, N, d_geo]
+        proj = torch.matmul(z, self.omega_geo)  # [B, N, r_geo]
+        # Positive feature map (non-negative), matching the "distance modulation" intent:
+        # phi_geo(z) = exp(proj - ||z||^2 / 2) / sqrt(r_geo)
+        z_norm = (z ** 2).sum(dim=-1, keepdim=True) * 0.5  # [B, N, 1]
+        phi = torch.exp(proj - z_norm) * self._inv_sqrt_r  # [B, N, r_geo]
+        return phi
 
 
 class LBR1d(nn.Module):
@@ -187,7 +228,14 @@ class OffsetAttention(nn.Module):
 
 
 class PerformerOffsetAttention(nn.Module):
-    def __init__(self, channels: int, nb_features: int = 64):
+    def __init__(
+        self,
+        channels: int,
+        nb_features: int = 64,
+        add_dist: bool = False,
+        geo_d_geo: int = 16,
+        geo_r_geo: int = 16,
+    ):
         super().__init__()
         da = channels // 4
         self.q = nn.Conv1d(channels, da, 1, bias=False)
@@ -199,6 +247,7 @@ class PerformerOffsetAttention(nn.Module):
         projection = _create_orthogonal_random_matrix(da, nb_features, device="cpu", dtype=torch.float32)
         self.register_buffer("projection_matrix", projection)
         self.attn_time_s = 0.0
+        self.geo_rff = GeoRFF(d_geo=geo_d_geo, r_geo=geo_r_geo) if add_dist else None
 
     @staticmethod
     def _sync_if_cuda(x: torch.Tensor):
@@ -224,7 +273,7 @@ class PerformerOffsetAttention(nn.Module):
             )
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, pos: torch.Tensor | None = None) -> torch.Tensor:
         # x: [B, C, N]
         self._sync_if_cuda(x)
         t0 = time.perf_counter()
@@ -238,12 +287,27 @@ class PerformerOffsetAttention(nn.Module):
         q_prime = _softmax_positive_feature_map_hyp(q, self.projection_matrix, eps=self.eps)  # [B,N,2M]
         k_prime = _softmax_positive_feature_map_hyp(k, self.projection_matrix, eps=self.eps)  # [B,N,2M]
 
-        kv = torch.bmm(k_prime.transpose(1, 2), v)  # [B,2M,N] @ [B,N,C] -> [B,2M,C]
-        k_sum = k_prime.sum(dim=1)  # [B,2M]
-        denom = torch.bmm(q_prime, k_sum.unsqueeze(-1))  # [B,N,2M] @ [B,2M,1] -> [B,N,1]
-        denom = denom + self.eps
+        if self.geo_rff is not None and pos is not None:
+            # Outer-product feature composition:
+            #   Phi_q(i) = phi_sm(q_i) ⊗ phi_geo(pos_i)
+            # Then linear attention works on the composed feature dimension.
+            phi_geo = self.geo_rff(pos)  # [B, N, r_geo]
+            B, N, r_sm = q_prime.shape
+            r_geo_out = phi_geo.shape[-1]
+            Phi_q = (q_prime.unsqueeze(-1) * phi_geo.unsqueeze(-2)).reshape(B, N, r_sm * r_geo_out)
+            Phi_k = (k_prime.unsqueeze(-1) * phi_geo.unsqueeze(-2)).reshape(B, N, r_sm * r_geo_out)
 
-        fsa = torch.bmm(q_prime, kv) / denom  # [B,N,2M] @ [B,2M,C] -> [B,N,C]
+            kv = torch.bmm(Phi_k.transpose(1, 2), v)  # [B, R_total, C]
+            k_sum = Phi_k.sum(dim=1)  # [B, R_total]
+            denom = torch.bmm(Phi_q, k_sum.unsqueeze(-1)) + self.eps  # [B, N, 1]
+            fsa = torch.bmm(Phi_q, kv) / denom  # [B, N, C]
+        else:
+            kv = torch.bmm(k_prime.transpose(1, 2), v)  # [B,2M,N] @ [B,N,C] -> [B,2M,C]
+            k_sum = k_prime.sum(dim=1)  # [B,2M]
+            denom = torch.bmm(q_prime, k_sum.unsqueeze(-1))  # [B,N,2M] @ [B,2M,1] -> [B,N,1]
+            denom = denom + self.eps
+            fsa = torch.bmm(q_prime, kv) / denom  # [B,N,2M] @ [B,2M,C] -> [B,N,C]
+
         fsa = fsa.transpose(1, 2).contiguous()  # [B,C,N]
 
         out = self.proj(x - fsa) + x
@@ -260,19 +324,23 @@ class PCTClassifier(nn.Module):
         dropout: float = 0.5,
         performer: bool = False,
         performer_nb_features: int = 64,
+        add_dist: bool = False,
     ):
         super().__init__()
         self.embed = NeighborEmbedding(npoints=npoints)
         if performer:
-            self.att1 = PerformerOffsetAttention(256, nb_features=performer_nb_features)
-            self.att2 = PerformerOffsetAttention(256, nb_features=performer_nb_features)
-            self.att3 = PerformerOffsetAttention(256, nb_features=performer_nb_features)
-            self.att4 = PerformerOffsetAttention(256, nb_features=performer_nb_features)
+            self.att1 = PerformerOffsetAttention(256, nb_features=performer_nb_features, add_dist=add_dist)
+            self.att2 = PerformerOffsetAttention(256, nb_features=performer_nb_features, add_dist=add_dist)
+            self.att3 = PerformerOffsetAttention(256, nb_features=performer_nb_features, add_dist=add_dist)
+            self.att4 = PerformerOffsetAttention(256, nb_features=performer_nb_features, add_dist=add_dist)
         else:
+            # Baseline path is kept identical regardless of add_dist.
             self.att1 = OffsetAttention(256)
             self.att2 = OffsetAttention(256)
             self.att3 = OffsetAttention(256)
             self.att4 = OffsetAttention(256)
+        self._performer_enabled = performer
+        self._add_dist = add_dist
         self.linear_fuse = nn.Sequential(
             nn.Conv1d(256 * 4, 1024, 1, bias=False),
             nn.BatchNorm1d(1024),
@@ -292,13 +360,25 @@ class PCTClassifier(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         # x: [B, N, 3]
-        _, feat = self.embed(x)         # [B, N/4, 256]
+        xyz2, feat = self.embed(x)   # xyz2: [B, N/4, 3], feat: [B, N/4, 256]
         f = feat.transpose(1, 2).contiguous()  # [B,256,N']
 
-        f1 = self.att1(f)
-        f2 = self.att2(f1)
-        f3 = self.att3(f2)
-        f4 = self.att4(f3)
+        if self._performer_enabled:
+            if self._add_dist:
+                f1 = self.att1(f, xyz2)
+                f2 = self.att2(f1, xyz2)
+                f3 = self.att3(f2, xyz2)
+                f4 = self.att4(f3, xyz2)
+            else:
+                f1 = self.att1(f)
+                f2 = self.att2(f1)
+                f3 = self.att3(f2)
+                f4 = self.att4(f3)
+        else:
+            f1 = self.att1(f)
+            f2 = self.att2(f1)
+            f3 = self.att3(f2)
+            f4 = self.att4(f3)
 
         out = torch.cat([f1, f2, f3, f4], dim=1)
         out = self.linear_fuse(out)

@@ -187,6 +187,7 @@ def main():
     parser.add_argument("--performer", type=str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--performer_nb_features", type=int, default=64)
     parser.add_argument("--performer_redraw_interval", type=int, default=1000)
+    parser.add_argument("--add_dist", type=str2bool, nargs="?", const=True, default=False)
     parser.add_argument("--log_path", type=str, default="")
     args = parser.parse_args()
 
@@ -223,6 +224,7 @@ def main():
         npoints=args.npoints,
         performer=args.performer,
         performer_nb_features=args.performer_nb_features,
+        add_dist=args.add_dist,
     ).to(device)
     criterion = nn.CrossEntropyLoss()
     optimizer = torch.optim.SGD(
