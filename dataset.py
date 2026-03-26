@@ -6,12 +6,33 @@ import torch
 from torch.utils.data import Dataset
 
 
-def read_off_vertices(path: str) -> np.ndarray:
+def read_off_vertices(path: str, off_new_format: bool = False) -> np.ndarray:
+    """
+    Read vertices from an OFF file.
+
+    off_new_format=False keeps the original strict behavior:
+      first line must be exactly 'OFF'.
+    off_new_format=True additionally supports first-line forms like:
+      'OFF593 376 0' or 'OFF 593 376 0'
+    """
     with open(path, "r", encoding="utf-8") as f:
         header = f.readline().strip()
-        if header != "OFF":
-            raise ValueError(f"Invalid OFF header in {path}: {header}")
-        n_verts, _, _ = map(int, f.readline().strip().split())
+        if not off_new_format:
+            # Keep backward-compatible strict parsing.
+            if header != "OFF":
+                raise ValueError(f"Invalid OFF header in {path}: {header}")
+            n_verts, _, _ = map(int, f.readline().strip().split())
+        else:
+            # Relax parsing to accept 'OFF<counts...>' on the first line.
+            if not header.startswith("OFF"):
+                raise ValueError(f"Invalid OFF header in {path}: {header}")
+
+            rest = header[3:].strip()  # after 'OFF'
+            if rest:
+                n_verts, _, _ = map(int, rest.split())
+            else:
+                n_verts, _, _ = map(int, f.readline().strip().split())
+
         verts = []
         for _ in range(n_verts):
             x, y, z = map(float, f.readline().strip().split()[:3])
@@ -42,13 +63,21 @@ def random_point_dropout(points: np.ndarray, max_dropout_ratio: float = 0.875) -
 
 
 class ModelNet10(Dataset):
-    def __init__(self, root: str, split: str, npoints: int = 1024, augment: bool = False):
+    def __init__(
+        self,
+        root: str,
+        split: str,
+        npoints: int = 1024,
+        augment: bool = False,
+        off_new_format: bool = False,
+    ):
         super().__init__()
         assert split in ["train", "test"]
         self.root = root
         self.split = split
         self.npoints = npoints
         self.augment = augment
+        self.off_new_format = off_new_format
 
         self.classes = sorted(
             [d for d in os.listdir(root) if os.path.isdir(os.path.join(root, d))]
@@ -68,7 +97,7 @@ class ModelNet10(Dataset):
 
     def __getitem__(self, index: int):
         path, label = self.samples[index]
-        pts = read_off_vertices(path)
+        pts = read_off_vertices(path, off_new_format=self.off_new_format)
 
         if pts.shape[0] >= self.npoints:
             choice = np.random.choice(pts.shape[0], self.npoints, replace=False)

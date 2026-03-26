@@ -188,6 +188,14 @@ def main():
     parser.add_argument("--performer_nb_features", type=int, default=64)
     parser.add_argument("--performer_redraw_interval", type=int, default=1000)
     parser.add_argument("--add_dist", type=str2bool, nargs="?", const=True, default=False)
+    parser.add_argument(
+        "--off_new_format",
+        type=str2bool,
+        nargs="?",
+        const=True,
+        default=False,
+        help="Relax OFF header parsing to support formats like 'OFF593 376 0'.",
+    )
     parser.add_argument("--log_path", type=str, default="")
     args = parser.parse_args()
 
@@ -201,8 +209,20 @@ def main():
         log_path = f"logs/train_{'performer' if args.performer else 'pct'}_{stamp}.log"
     logger = Logger(log_path)
 
-    train_set = ModelNet10(root=args.data_root, split="train", npoints=args.npoints, augment=True)
-    test_set = ModelNet10(root=args.data_root, split="test", npoints=args.npoints, augment=False)
+    train_set = ModelNet10(
+        root=args.data_root,
+        split="train",
+        npoints=args.npoints,
+        augment=True,
+        off_new_format=args.off_new_format,
+    )
+    test_set = ModelNet10(
+        root=args.data_root,
+        split="test",
+        npoints=args.npoints,
+        augment=False,
+        off_new_format=args.off_new_format,
+    )
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
