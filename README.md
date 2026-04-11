@@ -14,13 +14,13 @@ The implementation of PCT and its variants is provided in `model.py`.
 bash run.sh
 ```
 
-This runs the full training sweep: Performer and baseline PCT, **ModelNet10** and **ModelNet40**, and multiple input sizes (**1024** and **4096** points where applicable), including the geometric Performer run (`--add_dist`).
+This runs the full training sweep: Performer and baseline PCT, **ModelNet10** and **ModelNet40**, and multiple input sizes (1024 and 4096 points where applicable), including the geometric Performer run (`--add_dist`).
 
 Edit `--data_root` in `run.sh` to match your local ModelNet paths (defaults include `data/ModelNet10` and `/root/autodl-tmp/ModelNet40`).
 
 ### Attention length benchmark
 
-`bench_attention_n_sweep.py` feeds **random tensors** at several sequence lengths \(N\) and compares `OffsetAttention` vs `PerformerOffsetAttention` forward time — useful to see where linear attention pays off on long sequences.
+`bench_attention_n_sweep.py` feeds random tensors at several sequence lengths \(N\) and compares `OffsetAttention` vs `PerformerOffsetAttention` forward time — useful to see where linear attention pays off on long sequences.
 
 ```bash
 python bench_attention_n_sweep.py
