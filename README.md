@@ -27,4 +27,4 @@ python bench_attention_n_sweep.py
 python bench_attention_n_sweep.py --n_list 256 512 1024 2048 4096 8192
 ```
 
-Requires CUDA for meaningful GPU timing; see the script header for notes on synchronization and relative comparisons.
+Requires CUDA for meaningful GPU timing.
