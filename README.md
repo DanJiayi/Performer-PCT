@@ -2,7 +2,7 @@
 
 ### Models 
 The implementation of PCT and its variants is provided in `model.py`.
-- **Baseline**: `OffsetAttention` — standard offset attention ($ N \times N$ cost).
+- **Baseline**: `OffsetAttention` — standard offset attention ($N \times N$ cost).
 - **Efficient variant**: `PerformerOffsetAttention` — kernel-feature linear attention (linear in sequence length).
 - **Geometric variant**: enable `--add_dist` so `PerformerOffsetAttention` uses positional RFF features (`GeoRFF`) fused with the Performer map.
 
